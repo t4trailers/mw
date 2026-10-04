@@ -14,13 +14,11 @@ from datetime import datetime
 # ============================================================
 
 FRONTEND_URL = "http://10.15.223.139/"
-OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "BEATBOX_LINKS")
 
 # 🔥 DISCORD WEBHOOK
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1553665610666344591/9Au8Z7WU3gEbzD9T-fngsSJkvp8RziyO1u2EpTYW6tEWld6pWz2X6VY6wtlnTSER-WXi"
 
 MAX_WORKERS = 16
-MAX_RETRIES = 2
 TIMEOUT = 8
 
 PREVIEW_START = 1
@@ -39,7 +37,7 @@ URL_PATTERN = re.compile(
 )
 
 # ============================================================
-#  DISCORD SENDER
+#  DISCORD SENDER (No Disk Save)
 # ============================================================
 
 class DiscordSender:
@@ -47,46 +45,82 @@ class DiscordSender:
         self.webhook_url = webhook_url
         self.lock = threading.Lock()
 
-    def send_file(self, filepath, category, count):
-        """Send txt file to Discord webhook"""
-        if not os.path.exists(filepath):
-            print(f"   ⚠️ File not found: {filepath}")
-            return False
-
-        filename = os.path.basename(filepath)
+    def send_content(self, content, filename, category, count):
+        """Send content directly from memory — NO DISK SAVE"""
+        # Check size limit (Discord = 8MB for free webhooks)
+        content_bytes = content.encode('utf-8')
+        size_mb = len(content_bytes) / (1024 * 1024)
+        
+        if size_mb > 7.5:
+            # Too big — split and send in chunks
+            print(f"   ⚠️ File too big ({size_mb:.2f}MB), splitting...")
+            return self._send_split(content, filename, category, count)
         
         try:
-            with open(filepath, 'rb') as f:
-                files = {
-                    'file': (filename, f, 'text/plain')
-                }
-                payload = {
-                    'content': f"📂 **{category.upper()}** — `{count}` links\n📁 File: `{filename}`\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                }
-                
+            files = {
+                'file': (filename, content_bytes, 'text/plain')
+            }
+            payload = {
+                'content': f"📂 **{category.upper()}** — `{count}` links\n"
+                           f"📁 File: `{filename}`\n"
+                           f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            }
+            
+            with self.lock:
                 r = requests.post(self.webhook_url, data=payload, files=files, timeout=30)
-                
-                if r.status_code in (200, 204):
-                    print(f"   ✅ Sent to Discord: {filename} ({count} links)")
-                    return True
-                else:
-                    print(f"   ❌ Discord error: {r.status_code} - {r.text[:100]}")
-                    return False
+            
+            if r.status_code in (200, 204):
+                print(f"   ✅ Sent: {filename} ({count} links, {size_mb:.2f}MB)")
+                return True
+            else:
+                print(f"   ❌ Discord error: {r.status_code} - {r.text[:100]}")
+                return False
         except Exception as e:
             print(f"   ❌ Discord exception: {e}")
             return False
 
+    def _send_split(self, content, filename, category, count):
+        """Split large content into chunks"""
+        lines = content.split('\n')
+        chunk_size = 5000  # lines per chunk
+        chunks = [lines[i:i+chunk_size] for i in range(0, len(lines), chunk_size)]
+        
+        for idx, chunk in enumerate(chunks, 1):
+            chunk_content = '\n'.join(chunk)
+            part_name = f"{filename.replace('.txt', '')}_part{idx}.txt"
+            
+            try:
+                files = {'file': (part_name, chunk_content.encode('utf-8'), 'text/plain')}
+                payload = {
+                    'content': f"📂 **{category.upper()}** (Part {idx}/{len(chunks)})\n"
+                               f"📁 File: `{part_name}`"
+                }
+                
+                with self.lock:
+                    r = requests.post(self.webhook_url, data=payload, files=files, timeout=30)
+                    time.sleep(1)  # Rate limit protection
+                
+                if r.status_code in (200, 204):
+                    print(f"   ✅ Sent part {idx}/{len(chunks)}: {part_name}")
+                else:
+                    print(f"   ❌ Part {idx} failed: {r.status_code}")
+            except Exception as e:
+                print(f"   ❌ Part {idx} exception: {e}")
+        
+        return True
+
     def send_message(self, message):
         """Send plain text message to Discord"""
         try:
-            r = requests.post(self.webhook_url, json={'content': message}, timeout=15)
+            with self.lock:
+                r = requests.post(self.webhook_url, json={'content': message}, timeout=15)
             return r.status_code in (200, 204)
         except Exception:
             return False
 
 
 # ============================================================
-#  SCRAPER
+#  SCRAPER (No Disk Save)
 # ============================================================
 
 class FastScraper:
@@ -109,14 +143,8 @@ class FastScraper:
         self.start_time = time.time()
         self.last_update = time.time()
         
-        # Track which categories have been sent
-        self.sent_categories = set()
-        
         # Discord sender
         self.discord = DiscordSender(DISCORD_WEBHOOK)
-        
-        # Create output directory
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
         
         # Session
         self.session = requests.Session()
@@ -137,7 +165,7 @@ class FastScraper:
         signal.signal(signal.SIGINT, self.signal_handler)
 
     def signal_handler(self, sig, frame):
-        print("\n\n⚠️ Stopping... Saving & Sending collected links...")
+        print("\n\n⚠️ Stopping... Sending collected links to Discord...")
         self.running = False
 
     def categorize(self, url):
@@ -175,52 +203,45 @@ class FastScraper:
         
         return found
 
-    def save_category_file(self, category):
-        """Save a single category's links to its own txt file and send to Discord"""
+    def build_category_content(self, category):
+        """Build content in memory — NO DISK SAVE"""
         links = self.all_links[category]
         if not links:
+            return None
+        
+        content = "="*80 + "\n"
+        content += f"  🎯 BEAT BOX - {category.upper()}\n"
+        content += f"  📅 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        content += f"  📊 Total Links: {len(links)}\n"
+        content += "="*80 + "\n\n"
+        
+        for link in sorted(links):
+            content += f"{link}\n"
+        
+        content += "\n" + "="*80 + "\n"
+        return content
+
+    def send_category(self, category):
+        """Send a single category to Discord (from memory)"""
+        content = self.build_category_content(category)
+        if content is None:
             return
         
+        count = len(self.all_links[category])
         filename = f"BEATBOX_{category.upper()}.txt"
-        filepath = os.path.join(OUTPUT_DIR, filename)
         
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write("="*80 + "\n")
-                f.write(f"  🎯 BEAT BOX - {category.upper()}\n")
-                f.write(f"  📅 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"  📊 Total Links: {len(links)}\n")
-                f.write("="*80 + "\n\n")
-                
-                for link in sorted(links):
-                    f.write(f"{link}\n")
-                
-                f.write("\n" + "="*80 + "\n")
-            
-            print(f"\n   💾 Saved: {filename} ({len(links)} links)")
-            
-            # Send to Discord
-            self.discord.send_file(filepath, category, len(links))
-            
-        except Exception as e:
-            print(f"   ❌ Save error for {category}: {e}")
+        print(f"\n   📤 Sending {category.upper()} ({count} links)...")
+        self.discord.send_content(content, filename, category, count)
 
-    def flush_completed_categories(self):
-        """Check & send any completed categories"""
-        with self.lock:
-            for category in self.all_links.keys():
-                if category in self.sent_categories:
-                    continue
-                # Send if there are links (even partial)
-                if self.all_links[category]:
-                    self.sent_categories.add(category)
-                    # Release lock before sending
-                    links_copy = list(self.all_links[category])
+    def send_all_categories(self, final=True):
+        """Send all categories to Discord"""
+        print("\n" + "="*60)
+        print(f"📤 Sending {'FINAL' if final else 'INTERMEDIATE'} files to Discord...")
+        print("="*60)
         
-        # Send outside lock
-        for category in list(self.sent_categories):
-            if category in self.sent_categories:
-                self.save_category_file(category)
+        for category in ['movies', 'games', 'music', 'software', 'tvshows', 'wallpapers', 'videos', 'other']:
+            if self.all_links[category]:
+                self.send_category(category)
 
     def scrape_one(self, movie_id):
         if not self.running:
@@ -288,30 +309,31 @@ class FastScraper:
         
         print("""
 ╔══════════════════════════════════════════════════════════╗
-║   🎯 BEAT BOX - FASTEST LINK GRABBER v4.0               ║
-║   With Discord Auto-Send                                ║
+║   🎯 BEAT BOX - MEMORY-ONLY SCRAPER v5.0                ║
+║   No Disk Save • Only Discord                           ║
 ╚══════════════════════════════════════════════════════════╝
         """)
         print(f"📡 Target: {FRONTEND_URL}classic/moviepreview-*.html")
         print(f"🔢 Range: {start_id} to {end_id} ({total:,} pages)")
         print(f"⚡ Threads: {MAX_WORKERS}")
-        print(f"💾 Output: {OUTPUT_DIR}")
-        print(f"🔔 Discord: Enabled")
+        print(f"💾 Disk Save: ❌ DISABLED")
+        print(f"🔔 Discord: ✅ ENABLED")
         print(f"⏱️  Started: {datetime.now().strftime('%H:%M:%S')}")
         print("="*60)
-        print("Press Ctrl+C anytime to stop & save\n")
+        print("Press Ctrl+C anytime to stop & send to Discord\n")
         
         # Send start notification
         self.discord.send_message(
             f"🚀 **Beat Box Scraper Started**\n"
             f"📊 Range: `{start_id}` to `{end_id}`\n"
             f"⚡ Threads: `{MAX_WORKERS}`\n"
+            f"💾 Disk: ❌ Disabled\n"
             f"⏰ Started: `{datetime.now().strftime('%H:%M:%S')}`"
         )
         
-        # 🔥 INTERVAL-BASED SENDING (har 5 minute baad)
+        # Interval-based sending (har 10 minute baad)
         last_send_time = time.time()
-        SEND_INTERVAL = 300  # 5 minutes = 300 seconds
+        SEND_INTERVAL = 600  # 10 minutes
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = []
@@ -320,14 +342,12 @@ class FastScraper:
                     break
                 futures.append(executor.submit(self.scrape_one, movie_id))
             
-            # Wait with periodic sends
             while futures:
                 done, futures = concurrent.futures.wait(
                     futures, timeout=10,
                     return_when=concurrent.futures.FIRST_COMPLETED
                 )
                 
-                # Check interval
                 now = time.time()
                 if now - last_send_time >= SEND_INTERVAL:
                     print(f"\n⏰ Interval reached! Sending intermediate results...")
@@ -341,57 +361,42 @@ class FastScraper:
         self.print_progress()
         print()
 
-    def send_all_categories(self, final=True):
-        """Send all categories that have links (to Discord)"""
-        print("\n" + "="*60)
-        print(f"📤 Sending {'FINAL' if final else 'INTERMEDIATE'} files to Discord...")
-        print("="*60)
-        
-        for category in ['movies', 'games', 'music', 'software', 'tvshows', 'wallpapers', 'videos', 'other']:
-            links = self.all_links[category]
-            if links:
-                self.save_category_file(category)
-
     def save_links(self, final=True):
-        """Save all collected links"""
+        """Send all collected links to Discord (no disk save)"""
         print("\n" + "="*60)
-        print("💾 Saving & Sending results...")
+        print("📤 Sending ALL results to Discord...")
         
         total = sum(len(v) for v in self.all_links.values())
         elapsed = time.time() - self.start_time
         
-        # Save & send each category separately
+        # Send each category separately
         self.send_all_categories(final=final)
         
-        # Also save a master file
+        # Build & send master file (in memory)
         try:
-            master_file = os.path.join(OUTPUT_DIR, "BEATBOX_ALL_LINKS.txt")
-            with open(master_file, 'w', encoding='utf-8') as f:
-                f.write("="*80 + "\n")
-                f.write("  🎯 BEAT BOX - ALL LINKS\n")
-                f.write(f"  📅 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"  ⏱️  Total Time: {int(elapsed//60)}m {int(elapsed%60)}s\n")
-                f.write(f"  📊 Pages Scanned: {self.processed}\n")
-                f.write("="*80 + "\n\n")
-                
-                for category in ['movies', 'games', 'music', 'software', 'tvshows', 'wallpapers', 'videos', 'other']:
-                    links = self.all_links[category]
-                    if links:
-                        f.write(f"\n{'█'*60}\n")
-                        f.write(f"  📂 {category.upper()} ({len(links)} links)\n")
-                        f.write(f"{'█'*60}\n\n")
-                        for link in sorted(links):
-                            f.write(f"{link}\n")
-                        f.write("\n")
-                
-                f.write("\n" + "="*80 + "\n")
-                f.write(f"  ✅ TOTAL LINKS: {total}\n")
-                f.write("="*80 + "\n")
+            master_content = "="*80 + "\n"
+            master_content += "  🎯 BEAT BOX - ALL LINKS\n"
+            master_content += f"  📅 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            master_content += f"  ⏱️  Total Time: {int(elapsed//60)}m {int(elapsed%60)}s\n"
+            master_content += f"  📊 Pages Scanned: {self.processed}\n"
+            master_content += "="*80 + "\n\n"
             
-            print(f"\n✅ Master file saved: {master_file}")
+            for category in ['movies', 'games', 'music', 'software', 'tvshows', 'wallpapers', 'videos', 'other']:
+                links = self.all_links[category]
+                if links:
+                    master_content += f"\n{'█'*60}\n"
+                    master_content += f"  📂 {category.upper()} ({len(links)} links)\n"
+                    master_content += f"{'█'*60}\n\n"
+                    for link in sorted(links):
+                        master_content += f"{link}\n"
+                    master_content += "\n"
             
-            # Send master file to Discord
-            self.discord.send_file(master_file, "ALL_CATEGORIES", total)
+            master_content += "\n" + "="*80 + "\n"
+            master_content += f"  ✅ TOTAL LINKS: {total}\n"
+            master_content += "="*80 + "\n"
+            
+            print(f"\n📤 Sending master file...")
+            self.discord.send_content(master_content, "BEATBOX_ALL_LINKS.txt", "ALL_CATEGORIES", total)
             
             # Send summary message
             self.discord.send_message(
@@ -399,18 +404,18 @@ class FastScraper:
                 f"📊 **Total Links:** `{total}`\n"
                 f"📄 **Pages Scanned:** `{self.processed}`\n"
                 f"⏱️ **Time:** `{int(elapsed//60)}m {int(elapsed%60)}s`\n"
-                f"📁 **Files Sent:** `{len([c for c in self.all_links if self.all_links[c]])}` categories\n\n"
+                f"📁 **Files Sent:** `{len([c for c in self.all_links if self.all_links[c]])}` categories\n"
+                f"💾 **Disk Save:** ❌ Disabled\n\n"
                 f"🎉 **All Done!**"
             )
             
         except Exception as e:
-            print(f"\n❌ Save error: {e}")
+            print(f"\n❌ Discord error: {e}")
         
         print(f"\n✅ DONE!")
-        print(f"📊 Total links found: {total}")
-        print(f"📁 Saved at: {OUTPUT_DIR}")
-        print(f"⏱️  Time taken: {int(elapsed//60)}m {int(elapsed%60)}s")
-        print("\n🎉 All files sent to Discord!")
+        print(f"📊 Total links: {total}")
+        print(f"📤 All files sent to Discord!")
+        print(f"⏱️  Time: {int(elapsed//60)}m {int(elapsed%60)}s")
         return True
 
     def run(self, start_id, end_id):
@@ -418,7 +423,7 @@ class FastScraper:
             self.scrape_all(start_id, end_id)
             return self.save_links(final=True)
         except KeyboardInterrupt:
-            print("\n\n⚠️ Interrupted! Saving & Sending...")
+            print("\n\n⚠️ Interrupted! Sending to Discord...")
             return self.save_links(final=True)
         except Exception as e:
             print(f"\n❌ Error: {e}")
@@ -430,7 +435,7 @@ class FastScraper:
 # ============================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Beat Box Fastest Link Grabber v4.0')
+    parser = argparse.ArgumentParser(description='Beat Box Memory-Only Scraper v5.0')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Show every found link')
     parser.add_argument('--start', type=int, default=PREVIEW_START,
